@@ -17,13 +17,19 @@ use futures_core::task::{Context, Poll};
 use futures_timer::Delay;
 use pin_project_lite::pin_project;
 use reqwest::header::{HeaderName, HeaderValue};
-use reqwest::{Error as ReqwestError, IntoUrl, RequestBuilder, Response, StatusCode};
+use reqwest::{IntoUrl, RequestBuilder, Response, StatusCode};
+
+#[cfg(not(feature = "middleware"))]
+use reqwest::Error as ReqwestErrorImp;
+
+#[cfg(feature = "middleware")]
+use reqwest_middleware::{ClientWithMiddleware, Error as ReqwestErrorImp};
 use std::time::Duration;
 
 #[cfg(not(target_arch = "wasm32"))]
-type ResponseFuture = BoxFuture<'static, Result<Response, ReqwestError>>;
+type ResponseFuture = BoxFuture<'static, Result<Response, ReqwestErrorImp>>;
 #[cfg(target_arch = "wasm32")]
-type ResponseFuture = LocalBoxFuture<'static, Result<Response, ReqwestError>>;
+type ResponseFuture = LocalBoxFuture<'static, Result<Response, ReqwestErrorImp>>;
 
 #[cfg(not(target_arch = "wasm32"))]
 type EventStream = BoxStream<'static, Result<MessageEvent, EventStreamError<ReqwestError>>>;
@@ -31,6 +37,93 @@ type EventStream = BoxStream<'static, Result<MessageEvent, EventStreamError<Reqw
 type EventStream = LocalBoxStream<'static, Result<MessageEvent, EventStreamError<ReqwestError>>>;
 
 type BoxedRetry = Box<dyn RetryPolicy + Send + Unpin + 'static>;
+
+pub struct ReqwestError {
+    #[cfg(not(feature = "middleware"))]
+    error: reqwest::Error,
+    #[cfg(feature = "middleware")]
+    error: reqwest_middleware::Error,
+}
+
+impl core::fmt::Debug for ReqwestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl core::fmt::Display for ReqwestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl core::error::Error for ReqwestError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.error.source()
+    }
+}
+
+impl ReqwestError {
+    pub fn with_url(self, url: reqwest::Url) -> Self {
+        Self {
+            error: self.error.with_url(url),
+        }
+    }
+    pub fn without_url(self) -> Self {
+        Self {
+            error: self.error.without_url(),
+        }
+    }
+    pub fn is_body(&self) -> bool {
+        self.error.is_body()
+    }
+    pub fn is_builder(&self) -> bool {
+        self.error.is_builder()
+    }
+    pub fn is_connect(&self) -> bool {
+        self.error.is_connect()
+    }
+    pub fn is_decode(&self) -> bool {
+        self.error.is_decode()
+    }
+    pub fn is_redirect(&self) -> bool {
+        self.error.is_redirect()
+    }
+    pub fn is_request(&self) -> bool {
+        self.error.is_request()
+    }
+    pub fn is_status(&self) -> bool {
+        self.error.is_status()
+    }
+    pub fn is_timeout(&self) -> bool {
+        self.error.is_timeout()
+    }
+
+    #[cfg(not(feature = "middleware"))]
+    pub fn is_upgrade(&self) -> bool {
+        self.error.is_upgrade()
+    }
+
+    #[cfg(feature = "middleware")]
+    pub fn is_upgrade(&self) -> bool {
+        false
+    }
+
+    #[cfg(feature = "middleware")]
+    pub fn is_middleware(&self) -> bool {
+        self.error.is_middleware()
+    }
+
+    pub fn status(&self) -> Option<StatusCode> {
+        self.error.status()
+    }
+    pub fn url(&self) -> Option<&reqwest::Url> {
+        self.error.url()
+    }
+    pub fn url_mut(&mut self) -> Option<&mut reqwest::Url> {
+        self.error.url_mut()
+    }
+}
 
 /// The ready state of an [`EventSource`]
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
@@ -44,12 +137,17 @@ pub enum ReadyState {
     Closed = 2,
 }
 
+#[cfg(feature = "middleware")]
+type ActRequestBuilder = reqwest_middleware::RequestBuilder;
+#[cfg(not(feature = "middleware"))]
+type ActRequestBuilder = RequestBuilder;
+
 pin_project! {
 /// Provides the [`Stream`] implementation for the [`Event`] items. This wraps the
 /// [`RequestBuilder`] and retries requests when they fail.
 #[project = EventSourceProjection]
 pub struct EventSource {
-    builder: RequestBuilder,
+    builder: ActRequestBuilder,
     #[pin]
     next_response: Option<ResponseFuture>,
     #[pin]
@@ -66,6 +164,33 @@ pub struct EventSource {
 impl EventSource {
     /// Wrap a [`RequestBuilder`]
     pub fn new(builder: RequestBuilder) -> Result<Self, CannotCloneRequestError> {
+        #[cfg(feature = "middleware")]
+        let (c, r) = builder.build_split();
+        #[cfg(feature = "middleware")]
+        let builder = reqwest_middleware::RequestBuilder::from_parts(
+            ClientWithMiddleware::new(c, []),
+            r.map_err(|_| CannotCloneRequestError)?,
+        );
+        let builder = builder.header(
+            reqwest::header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        let res_future = Box::pin(builder.try_clone().ok_or(CannotCloneRequestError)?.send());
+        Ok(Self {
+            builder,
+            next_response: Some(res_future),
+            cur_stream: None,
+            delay: None,
+            is_closed: false,
+            retry_policy: Box::new(DEFAULT_RETRY),
+            last_event_id: String::new(),
+            last_retry: None,
+        })
+    }
+    #[cfg(feature = "middleware")]
+    pub fn new_with_middleware(
+        builder: reqwest_middleware::RequestBuilder,
+    ) -> Result<Self, CannotCloneRequestError> {
         let builder = builder.header(
             reqwest::header::ACCEPT,
             HeaderValue::from_static("text/event-stream"),
@@ -86,6 +211,21 @@ impl EventSource {
     /// Create a simple EventSource based on a GET request
     pub fn get<T: IntoUrl>(url: T) -> Self {
         Self::new(reqwest::Client::new().get(url)).unwrap()
+    }
+
+    #[cfg(feature = "middleware")]
+    pub fn get_with_middleware<
+        T: IntoUrl,
+        U: Into<Box<[std::sync::Arc<dyn reqwest_middleware::Middleware + 'static>]>>,
+    >(
+        url: T,
+        middleware: U,
+    ) -> Self {
+        Self::new_with_middleware(
+            reqwest_middleware::ClientWithMiddleware::new(reqwest::Client::new(), middleware)
+                .get(url),
+        )
+        .unwrap()
     }
 
     /// Close the EventSource stream and stop trying to reconnect
@@ -149,6 +289,34 @@ fn check_response(response: Response) -> Result<Response, Error> {
     }
 }
 
+pin_project! {
+struct MapErr<S>{
+    #[pin]
+    stream: S
+}
+}
+
+impl<U, S: Stream<Item = Result<U, reqwest::Error>>> futures_core::Stream for MapErr<S> {
+    type Item = Result<U, ReqwestError>;
+
+    #[cfg(feature = "middleware")]
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.project()
+            .stream
+            .poll_next(cx)
+            .map_err(|error| ReqwestError {
+                error: reqwest_middleware::Error::Reqwest(error),
+            })
+    }
+    #[cfg(not(feature = "middleware"))]
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.project()
+            .stream
+            .poll_next(cx)
+            .map_err(|error| ReqwestError { error: error })
+    }
+}
+
 impl<'a> EventSourceProjection<'a> {
     fn clear_fetch(&mut self) {
         self.next_response.take();
@@ -169,7 +337,9 @@ impl<'a> EventSourceProjection<'a> {
 
     fn handle_response(&mut self, res: Response) {
         self.last_retry.take();
-        let mut stream = res.bytes_stream().eventsource();
+        let stream = res.bytes_stream();
+        let stream = MapErr { stream };
+        let mut stream = stream.eventsource();
         stream.set_last_event_id(self.last_event_id.clone());
         self.cur_stream.replace(Box::pin(stream));
     }
@@ -247,7 +417,7 @@ impl Stream for EventSource {
                     }
                 }
                 Poll::Ready(Err(err)) => {
-                    let err = Error::Transport(err);
+                    let err = Error::Transport(ReqwestError { error: err });
                     this.handle_error(&err);
                     return Poll::Ready(Some(Err(err)));
                 }
