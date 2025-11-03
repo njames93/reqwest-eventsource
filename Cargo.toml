@@ -13,6 +13,14 @@ description = "Helper to build an Eventsource using reqwest"
 keywords = ["sse", "eventsource", "reqwest", "stream", "event"]
 categories = ["web-programming::http-client", "no-std", "parsing", "asynchronous"]
 
+[features]
+middleware = ["dep:reqwest-middleware"]
+
+[[example]]
+name = "simple_digest"
+path = "examples/simple_digest.rs"
+required-features = ["middleware"]
+
 [dependencies]
 eventsource-stream = "0.2.3"
 reqwest = { version = "0.12.0", default-features = false, features = ["stream"] }
@@ -22,6 +30,7 @@ nom = "7.1.0"
 mime = "0.3.16"
 futures-timer = "3.0.2"
 thiserror = "1.0.30"
+reqwest-middleware = { version = "0.4.2", optional = true }
 
 [dev-dependencies]
 futures = "0.3.5"
@@ -29,3 +38,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 futures-retry = "0.6"
 pin-utils = "0.1"
 rocket = "0.5.0"
+digest_auth = "0.3.1"
+async-trait = "0.1.89"
+http = "1.3.1"
+

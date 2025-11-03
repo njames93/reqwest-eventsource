@@ -2,13 +2,14 @@ use core::fmt;
 use eventsource_stream::EventStreamError;
 use nom::error::Error as NomError;
 use reqwest::header::HeaderValue;
-use reqwest::Error as ReqwestError;
 use reqwest::Response;
 use reqwest::StatusCode;
 use std::string::FromUtf8Error;
 
 #[cfg(doc)]
 use reqwest::RequestBuilder;
+
+use crate::event_source::ReqwestError;
 
 /// Error raised when a [`RequestBuilder`] cannot be cloned. See [`RequestBuilder::try_clone`] for
 /// more information
