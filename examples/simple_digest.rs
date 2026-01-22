@@ -2,9 +2,8 @@ use digest_auth::{AuthContext, HttpMethod, WwwAuthenticateHeader};
 use futures::stream::StreamExt;
 use http::Extensions;
 use reqwest::{Request, Response};
-use reqwest_eventsource::{CannotCloneRequestError, Event, EventSource};
+use reqwest_eventsource::{CannotCloneRequestError, Event, RequestBuilderExt};
 use reqwest_middleware::{Middleware, Next};
-use std::sync::Arc;
 
 pub struct DigestAuth {
     username: String,
@@ -69,9 +68,12 @@ impl Middleware for DigestAuth {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut ms: Vec<Arc<dyn Middleware>> = Vec::new();
-    ms.push(Arc::new(DigestAuth::new("admin", "admin")));
-    let mut es = EventSource::get_with_middleware("http://localhost:8000/events_auth", ms);
+    let client = reqwest_middleware::ClientBuilder::new(reqwest::Client::new())
+        .with(DigestAuth::new("admin", "admin"))
+        .build();
+    let mut es = client
+        .get("http://localhost:8000/events_auth")
+        .eventsource()?;
     while let Some(event) = es.next().await {
         match event {
             Ok(Event::Open) => println!("Connection Open!"),
