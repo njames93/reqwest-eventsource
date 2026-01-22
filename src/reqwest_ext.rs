@@ -13,3 +13,10 @@ impl RequestBuilderExt for RequestBuilder {
         EventSource::new(self)
     }
 }
+
+#[cfg(feature = "middleware")]
+impl RequestBuilderExt for reqwest_middleware::RequestBuilder {
+    fn eventsource(self) -> Result<EventSource, CannotCloneRequestError> {
+        EventSource::new_with_middleware(self)
+    }
+}
